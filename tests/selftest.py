@@ -1,32 +1,58 @@
 #!/usr/bin/env python3
-"""只读查询 API 的端到端自测。
+"""跨仓调拨决定 API 的端到端自测。
+
+用前先安装依赖：pip install -r tests/requirements.txt
+
+覆盖：
+- 未登记决定的调拨：两侧都应是 prepared，不能报完成；
+- 提交：两库都按决定收尾，库存变化正确，重复提交幂等；
+- 撤销：两库都回滚，库存不变；
+- 相反决定：409，已登记决定不变；
+- 未知调拨号：404；
+- 决定已持久化、尚未收尾时进程重启：GET 仍能看到决定，重复提交可继续
+  并最终报完成；
+- 单边处理后进程重启（预备事务已不在列表里）：仍能确认该侧按决定
+  结束，再处理另一侧；
+- 并发提交同一决定：都成功，不重复扣减/入库。
 
 前置条件：
-- API 已在 BASE_URL（默认 http://127.0.0.1:8000）运行，POOL_SIZE=4；
-- 可选：环境变量 PSQL 给出 psql 连接串（如
-  "postgresql://app:app@127.0.0.1:5432/demo"），用于服务端核对
-  （连接数上限、无残留活跃查询、无失败事务）；未提供则跳过这些检查。
+- 三个 PostgreSQL 库已按 db/*/init.sql 初始化；
+- API 已在 BASE_URL（默认 http://127.0.0.1:8000）运行；
+- 环境变量 CONTROL_URL / SOURCE_URL / TARGET_URL 指向三个库；
+- 可选 RESTART_CMD：用于模拟进程重启，如
+  "docker compose restart api" 或一个本地脚本；未提供则跳过重启用例。
 
-用法：python3 tests/selftest.py
+用法：
+    python3 tests/selftest.py
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import random
 import subprocess
 import sys
 import time
-from contextlib import suppress
+import uuid
+from pathlib import Path
 
 import httpx
+import psycopg
 
 BASE = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
-POOL_SIZE = int(os.environ.get("POOL_SIZE", "4"))
-PSQL = os.environ.get("PSQL")  # 例如 postgresql://app:app@127.0.0.1:5432/demo
+CONTROL_URL = os.environ.get("CONTROL_URL")
+SOURCE_URL = os.environ.get("SOURCE_URL")
+TARGET_URL = os.environ.get("TARGET_URL")
+RESTART_CMD = os.environ.get("RESTART_CMD")
+TRANSFER = os.environ.get("TRANSFER_ID", "T-2024-0001")
 
 failures: list[str] = []
+
+# 每个用例用独立 SKU：预备事务在收尾前持有该行的写锁，共用 SKU 会让
+# 后准备的那笔一直等锁；跨测试运行也必须唯一，否则上次运行残留的预备
+# 事务会锁住同名行。seed.py 会在需要时自动建基线库存。
+def next_sku() -> str:
+    return f"SKU-T{uuid.uuid4().hex[:10]}"
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -36,306 +62,322 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         failures.append(f"{name}: {detail}")
 
 
-async def stats(client: httpx.AsyncClient) -> dict:
-    return (await client.get("/pool/stats")).json()
-
-
-def server_count(where: str = "") -> int | None:
-    """通过 pg_stat_activity 做服务端核对；无 psql 时返回 None。"""
-    if not PSQL:
-        return None
-    sql = ("SELECT count(*) FROM pg_stat_activity "
-           "WHERE application_name = 'ro-api' " + where)
-    try:
-        out = subprocess.run(
-            ["psql", PSQL, "-tAc", sql],
-            capture_output=True, text=True, timeout=10)
-        if out.returncode != 0:
-            return None
-        return int(out.stdout.strip())
-    except Exception:
-        return None
-
-
-class Sampler:
-    """高频采样 /pool/stats，校验不变量：
-    idle + in_use + cleaning == size 且 opened_connections <= size。"""
-
-    def __init__(self, client: httpx.AsyncClient):
-        self.client = client
-        self.violations: list[str] = []
-        self.max_in_use = 0
-        self.max_waiting = 0
-        self._stop = asyncio.Event()
-
-    async def run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                s = (await self.client.get("/pool/stats")).json()
-                self.max_in_use = max(self.max_in_use, s["in_use"])
-                self.max_waiting = max(self.max_waiting, s["waiting"])
-                total = s["idle"] + s["in_use"] + s["cleaning"]
-                if total != s["size"]:
-                    self.violations.append(f"slot leak: {s}")
-                if s["in_use"] > s["size"] or s["opened_connections"] > s["size"]:
-                    self.violations.append(f"limit exceeded: {s}")
-            except Exception as exc:  # noqa: BLE001
-                self.violations.append(f"sampler error: {exc}")
-            await asyncio.sleep(0.05)
-
-    def stop(self) -> None:
-        self._stop.set()
-
-
-async def wait_pool_idle(client: httpx.AsyncClient, timeout: float = 15) -> dict:
+def wait_api(timeout: float = 40) -> None:
     deadline = time.monotonic() + timeout
-    s = await stats(client)
     while time.monotonic() < deadline:
-        if s["idle"] == POOL_SIZE and s["cleaning"] == 0 and s["waiting"] == 0:
-            break
-        await asyncio.sleep(0.1)
-        s = await stats(client)
-    return s
+        try:
+            if httpx.get(f"{BASE}/health", timeout=2).status_code == 200:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(0.3)
+    raise SystemExit(f"API not reachable at {BASE}")
+
+
+def restart_api() -> None:
+    if not RESTART_CMD:
+        return
+    subprocess.run(RESTART_CMD, shell=True, check=True,
+                   stdout=subprocess.DEVNULL)
+    wait_api()
+
+
+def q(url: str, sql: str, params: tuple = ()) -> list[tuple]:
+    with psycopg.connect(url, autocommit=True, connect_timeout=3) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            if cur.description is None:
+                return []
+            return cur.fetchall()
+
+
+def side_stock(url: str, sku: str) -> int:
+    rows = q(url, "SELECT on_hand FROM inventory WHERE sku = %s", (sku,))
+    return rows[0][0] if rows else -1
+
+
+def prepared_gids(url: str) -> list[str]:
+    return [r[0] for r in q(url, "SELECT gid FROM pg_prepared_xacts")]
+
+
+def side_row(url: str, transfer_id: str, side: str):
+    rows = q(url,
+             "SELECT gid, status FROM transfer_registry "
+             "WHERE transfer_id = %s AND side = %s", (transfer_id, side))
+    return rows[0] if rows else None
+
+
+def seed(transfer_id: str, sku: str, qty: int,
+         decision: str | None = None) -> None:
+    """调用随仓库提供的样例准备脚本（需要与 API 相同的三库环境变量）。
+
+    在独立进程里跑，所以不会把测试进程里的连接带进新预备事务的锁冲突。
+    """
+    root = Path(__file__).resolve().parent.parent
+    cmd = [sys.executable, str(root / "app" / "seed.py"),
+           "--transfer", transfer_id, "--sku", sku, "--qty", str(qty),
+           "--force"]
+    if decision:
+        cmd += ["--decision", decision]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [str(root / "app"), os.environ.get("PYTHONPATH")]))
+    env.setdefault("PYTHONWARNINGS", "ignore")
+    subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL)
+
+
+def decide(client: httpx.Client, transfer_id: str, decision: str):
+    return client.post(f"/transfers/{transfer_id}/decision",
+                       json={"decision": decision})
+
+
+def state_of(payload: dict) -> dict[str, str]:
+    return {s["side"]: s["state"] for s in payload["sides"]}
+
+
+TEST_PREFIXES = ("T-UNDECIDED-", "T-COMMIT-", "T-ROLLBACK-", "T-CONFLICT-",
+                 "T-RESTART-", "T-ONESIDE-", "T-ONERB-", "T-RACE-", "T-LIST-")
+
+
+def cleanup_test_leftovers() -> None:
+    """撤销上次中断的测试留下的预备事务与登记（只碰测试前缀）。"""
+    for url in (SOURCE_URL, TARGET_URL):
+        rows = q(url, "SELECT gid, database FROM pg_prepared_xacts")
+        for gid, _db in rows:
+            if gid.startswith(TEST_PREFIXES):
+                q(url, "ROLLBACK PREPARED %s" % _lit(gid))
 
 
 # ---------------------------------------------------------------- 用例
 
-async def t_normal(client):
-    r = await client.post("/query/normal", json={"limit": 3})
-    check("normal: 200", r.status_code == 200, r.text)
-    if r.status_code == 200:
-        check("normal: 3 rows", len(r.json().get("rows", [])) == 3, r.text)
+def t_undecided(client):
+    tid = f"T-UNDECIDED-{uuid.uuid4().hex[:6]}"
+    seed(tid, next_sku(), 2)
+    r = client.get(f"/transfers/{tid}")
+    check("undecided: 200", r.status_code == 200, r.text)
+    d = r.json()
+    check("undecided: status", d["status"] == "undecided", str(d))
+    check("undecided: not completed", d["completed"] is False, str(d))
+    check("undecided: both prepared",
+          state_of(d) == {"source": "prepared", "target": "prepared"},
+          str(state_of(d)))
+    check("undecided: gids are prepared in both DBs",
+          f"{tid}:source" in prepared_gids(SOURCE_URL)
+          and f"{tid}:target" in prepared_gids(TARGET_URL))
 
 
-async def t_queue(client):
-    """8 个慢查询、池大小 4：4 个执行、4 个排队，最终全部完成。"""
-    sampler = Sampler(client)
-    stask = asyncio.create_task(sampler.run())
-    reqs = [asyncio.create_task(client.post("/query/slow", json={
-        "delay_seconds": 2, "acquire_timeout": 30, "query_timeout": 30}))
-        for _ in range(8)]
-    await asyncio.sleep(0.7)
-    mid = await stats(client)
-    check("queue: in_use == size", mid["in_use"] == POOL_SIZE, str(mid))
-    check("queue: waiting == 4", mid["waiting"] == 4, str(mid))
-    results = await asyncio.gather(*reqs)
-    sampler.stop()
-    await stask
+def t_commit(client):
+    tid = f"T-COMMIT-{uuid.uuid4().hex[:6]}"
+    sku = next_sku()
+    seed(tid, sku, 7)
+    s0, t0 = side_stock(SOURCE_URL, sku), side_stock(TARGET_URL, sku)
+
+    r = decide(client, tid, "commit")
+    check("commit: 200", r.status_code == 200, r.text)
+    d = r.json()
+    check("commit: completed", d["completed"] is True, str(d))
+    check("commit: both committed",
+          state_of(d) == {"source": "committed", "target": "committed"},
+          str(state_of(d)))
+    check("commit: repeated=False", d["repeated"] is False, str(d))
+    check("commit: source stock -7",
+          side_stock(SOURCE_URL, sku) == s0 - 7)
+    check("commit: target stock +7",
+          side_stock(TARGET_URL, sku) == t0 + 7)
+    check("commit: no prepared txns left",
+          f"{tid}:source" not in prepared_gids(SOURCE_URL)
+          and f"{tid}:target" not in prepared_gids(TARGET_URL))
+
+    r2 = decide(client, tid, "commit")
+    check("commit: repeat 200", r2.status_code == 200, r2.text)
+    d2 = r2.json()
+    check("commit: repeat repeated=True", d2["repeated"] is True, str(d2))
+    check("commit: repeat still completed", d2["completed"] is True, str(d2))
+    check("commit: repeat does not double-apply",
+          side_stock(SOURCE_URL, sku) == s0 - 7
+          and side_stock(TARGET_URL, sku) == t0 + 7)
+
+    r3 = decide(client, tid, "rollback")
+    check("commit: opposite -> 409", r3.status_code == 409, r3.text)
+    check("commit: decision unchanged",
+          client.get(f"/transfers/{tid}").json()["decision"] == "commit")
+
+
+def t_rollback(client):
+    tid = f"T-ROLLBACK-{uuid.uuid4().hex[:6]}"
+    sku = next_sku()
+    seed(tid, sku, 3)
+    s0, t0 = side_stock(SOURCE_URL, sku), side_stock(TARGET_URL, sku)
+    r = decide(client, tid, "rollback")
+    check("rollback: 200", r.status_code == 200, r.text)
+    d = r.json()
+    check("rollback: completed", d["completed"] is True, str(d))
+    check("rollback: both rolled back",
+          state_of(d) == {"source": "rolled_back", "target": "rolled_back"},
+          str(state_of(d)))
+    check("rollback: stock unchanged",
+          side_stock(SOURCE_URL, sku) == s0
+          and side_stock(TARGET_URL, sku) == t0)
+    r2 = decide(client, tid, "commit")
+    check("rollback: opposite -> 409", r2.status_code == 409, r2.text)
+
+
+def t_unknown(client):
+    r = client.get("/transfers/T-DOES-NOT-EXIST")
+    check("unknown: GET 404", r.status_code == 404, r.text)
+    r = decide(client, "T-DOES-NOT-EXIST", "commit")
+    check("unknown: POST 404", r.status_code == 404, r.text)
+
+
+def t_conflict_does_not_touch_prepared(client):
+    """相反决定被拒绝时，两侧预备事务必须原样保留。"""
+    tid = f"T-CONFLICT-{uuid.uuid4().hex[:6]}"
+    seed(tid, next_sku(), 1, decision="commit")
+    r = decide(client, tid, "rollback")
+    check("conflict: 409", r.status_code == 409, r.text)
+    check("conflict: source still prepared",
+          f"{tid}:source" in prepared_gids(SOURCE_URL))
+    check("conflict: target still prepared",
+          f"{tid}:target" in prepared_gids(TARGET_URL))
+    d = client.get(f"/transfers/{tid}").json()
+    check("conflict: decision still commit", d["decision"] == "commit", str(d))
+    # 收尾，避免留下残留
+    r = decide(client, tid, "commit")
+    check("conflict: cleanup commit ok", r.status_code == 200, r.text)
+
+
+def t_restart_before_processing(client):
+    """决定已持久化、两侧都还没收尾时重启：GET 仍应看到决定与两个 prepared。"""
+    tid = f"T-RESTART-{uuid.uuid4().hex[:6]}"
+    seed(tid, next_sku(), 2, decision="commit")
+    restart_api()
+    d = client.get(f"/transfers/{tid}").json()
+    check("restart: decision survived", d["decision"] == "commit", str(d))
+    check("restart: pending before processing", d["completed"] is False,
+          str(d))
+    check("restart: both prepared",
+          state_of(d) == {"source": "prepared", "target": "prepared"},
+          str(state_of(d)))
+    r = decide(client, tid, "commit")
+    check("restart: repeated submit completes", r.status_code == 200
+          and r.json()["completed"] is True, r.text)
+    check("restart: marked repeated", r.json()["repeated"] is True, r.text)
+
+
+def t_restart_after_one_side(client):
+    """一侧已被别人/上一进程处理完，重启后仍能确认其结局并继续另一侧。"""
+    tid = f"T-ONESIDE-{uuid.uuid4().hex[:6]}"
+    sku = next_sku()
+    # 预置决定（等同“决定已持久化但还没处理”），不经过 API 收尾
+    seed(tid, sku, 5, decision="commit")
+    s0, t0 = side_stock(SOURCE_URL, sku), side_stock(TARGET_URL, sku)
+    # 模拟“一边处理完后进程挂了”：手工只提交扣减侧，然后重启
+    q(SOURCE_URL, "COMMIT PREPARED %s" % _lit(f"{tid}:source"))
+    restart_api()
+
+    d = client.get(f"/transfers/{tid}").json()
+    states = state_of(d)
+    check("oneside: source committed from evidence",
+          states["source"] == "committed", str(d))
+    check("oneside: target still prepared", states["target"] == "prepared",
+          str(d))
+    check("oneside: not completed yet", d["completed"] is False, str(d))
+
+    r = decide(client, tid, "commit")
+    check("oneside: completes after repeat", r.status_code == 200
+          and r.json()["completed"] is True, r.text)
+    check("oneside: both committed",
+          state_of(r.json()) == {"source": "committed",
+                                 "target": "committed"}, r.text)
+    check("oneside: stock applied once",
+          side_stock(SOURCE_URL, sku) == s0 - 5
+          and side_stock(TARGET_URL, sku) == t0 + 5)
+
+
+def t_restart_after_rollback_side(client):
+    """撤销场景的单边处理：已撤销的一侧不再出现在预备列表，仍能确认。"""
+    tid = f"T-ONERB-{uuid.uuid4().hex[:6]}"
+    sku = next_sku()
+    seed(tid, sku, 4, decision="rollback")
+    s0, t0 = side_stock(SOURCE_URL, sku), side_stock(TARGET_URL, sku)
+    # 模拟“撤销侧已处理完、进程挂了”
+    q(SOURCE_URL, "ROLLBACK PREPARED %s" % _lit(f"{tid}:source"))
+    restart_api()
+
+    d = client.get(f"/transfers/{tid}").json()
+    states = state_of(d)
+    check("onerb: source rolled_back from evidence",
+          states["source"] == "rolled_back", str(d))
+    check("onerb: target still prepared", states["target"] == "prepared",
+          str(d))
+    r = decide(client, tid, "rollback")
+    check("onerb: completes after repeat", r.status_code == 200
+          and r.json()["completed"] is True, r.text)
+    check("onerb: stock unchanged",
+          side_stock(SOURCE_URL, sku) == s0
+          and side_stock(TARGET_URL, sku) == t0)
+
+
+def _lit(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def t_concurrent_same_decision(client):
+    tid = f"T-RACE-{uuid.uuid4().hex[:6]}"
+    sku = next_sku()
+    seed(tid, sku, 2)
+    s0, t0 = side_stock(SOURCE_URL, sku), side_stock(TARGET_URL, sku)
+
+    async def run() -> list[httpx.Response]:
+        async with httpx.AsyncClient(base_url=BASE, timeout=30) as ac:
+            return await asyncio.gather(*[
+                ac.post(f"/transfers/{tid}/decision",
+                        json={"decision": "commit"})
+                for _ in range(4)])
+
+    results = asyncio.run(run())
     codes = [r.status_code for r in results]
-    check("queue: all 8 finished 200", all(c == 200 for c in codes), str(codes))
-    check("queue: invariants held", not sampler.violations,
-          "; ".join(sampler.violations[:3]))
-    s = await wait_pool_idle(client)
-    check("queue: pool idle again", s["idle"] == POOL_SIZE, str(s))
+    check("race: all 200", all(c == 200 for c in codes), str(codes))
+    check("race: all completed",
+          all(r.json().get("completed") for r in results if r.status_code == 200),
+          str([r.text for r in results]))
+    check("race: stock applied once",
+          side_stock(SOURCE_URL, sku) == s0 - 2
+          and side_stock(TARGET_URL, sku) == t0 + 2)
 
 
-async def t_acquire_timeout(client):
-    """池被占满时，acquire_timeout=1 的请求应在约 1 秒后拿到 503。"""
-    blockers = [asyncio.create_task(client.post("/query/slow", json={
-        "delay_seconds": 3, "acquire_timeout": 30, "query_timeout": 30}))
-        for _ in range(POOL_SIZE)]
-    await asyncio.sleep(0.7)
-    t0 = time.monotonic()
-    r = await client.post("/query/slow", json={
-        "delay_seconds": 0.1, "acquire_timeout": 1, "query_timeout": 5})
-    dt = time.monotonic() - t0
-    check("acquire-timeout: 503", r.status_code == 503,
-          f"{r.status_code} {r.text}")
-    check("acquire-timeout: ~1s", 0.8 < dt < 2.5, f"{dt:.2f}s")
-    results = await asyncio.gather(*blockers)
-    check("acquire-timeout: blockers finished",
-          all(x.status_code == 200 for x in results),
-          str([x.status_code for x in results]))
-    await wait_pool_idle(client)
+def t_list(client):
+    tid = f"T-LIST-{uuid.uuid4().hex[:6]}"
+    seed(tid, next_sku(), 1)
+    r = client.get("/transfers")
+    check("list: 200", r.status_code == 200, r.text)
+    ids = [t["transfer_id"] for t in r.json()["transfers"]]
+    check("list: contains seeded", tid in ids, str(ids[:5]))
 
 
-async def t_queue_cancel(client):
-    """排队中的请求被客户端取消后，队列名额应立即释放。"""
-    blockers = [asyncio.create_task(client.post("/query/slow", json={
-        "delay_seconds": 2.5, "acquire_timeout": 30, "query_timeout": 30}))
-        for _ in range(POOL_SIZE)]
-    await asyncio.sleep(0.7)
-    before = await stats(client)
-    queued = asyncio.create_task(client.post("/query/slow", json={
-        "delay_seconds": 0.1, "acquire_timeout": 30, "query_timeout": 5}))
-    await asyncio.sleep(0.5)
-    mid = await stats(client)
-    check("cancel: waiting grew by 1",
-          mid["waiting"] == before["waiting"] + 1, f"{before} -> {mid}")
-    queued.cancel()  # 客户端放弃 -> 服务端应观测到断开
-    with suppress(asyncio.CancelledError):
-        await queued
-    deadline = time.monotonic() + 5
-    s = await stats(client)
-    while time.monotonic() < deadline and s["waiting"] != before["waiting"]:
-        await asyncio.sleep(0.1)
-        s = await stats(client)
-    check("cancel: queue slot released", s["waiting"] == before["waiting"],
-          str(s))
-    check("cancel: counter bumped",
-          s["counters"]["queue_cancelled"] > before["counters"]["queue_cancelled"],
-          str(s["counters"]))
-    results = await asyncio.gather(*blockers)
-    check("cancel: blockers still finish",
-          all(x.status_code == 200 for x in results),
-          str([x.status_code for x in results]))
-    await wait_pool_idle(client)
-
-
-async def t_query_timeout(client):
-    """query_timeout=1 的慢查询：504；连接不得带伤复用，池应恢复。"""
-    before = await stats(client)
-    t0 = time.monotonic()
-    r = await client.post("/query/slow", json={
-        "delay_seconds": 10, "acquire_timeout": 5, "query_timeout": 1})
-    dt = time.monotonic() - t0
-    check("query-timeout: 504", r.status_code == 504,
-          f"{r.status_code} {r.text}")
-    check("query-timeout: ~1s", 0.8 < dt < 3, f"{dt:.2f}s")
-    s = await wait_pool_idle(client)
-    check("query-timeout: pool recovered", s["idle"] == POOL_SIZE, str(s))
-    c, b = s["counters"], before["counters"]
-    check("query-timeout: recycled or replaced",
-          c["recycled"] + c["replaced"] > b["recycled"] + b["replaced"], str(c))
-    n = server_count()
-    if n is not None:
-        check("query-timeout: server conns <= size", n <= POOL_SIZE, f"n={n}")
-    active = server_count("AND state = 'active'")
-    if active is not None:
-        check("query-timeout: nothing running server-side", active == 0,
-              f"active={active}")
-    r = await client.post("/query/normal", json={"limit": 1})
-    check("query-timeout: normal query after", r.status_code == 200, r.text)
-
-
-async def t_sql_error(client):
-    """两种 SQL 报错：连接须清理/更换后才能复用，后续查询不受影响。"""
-    before = await stats(client)
-    r = await client.post("/query/error", json={"mode": "autocommit"})
-    check("sql-error: autocommit -> 400", r.status_code == 400,
-          f"{r.status_code} {r.text}")
-    r = await client.post("/query/error", json={"mode": "transaction"})
-    check("sql-error: transaction -> 400", r.status_code == 400,
-          f"{r.status_code} {r.text}")
-    s = await wait_pool_idle(client)
-    c, b = s["counters"], before["counters"]
-    check("sql-error: 2 connections sanitized",
-          c["recycled"] + c["replaced"] >= b["recycled"] + b["replaced"] + 2,
-          f"{b} -> {c}")
-    aborted = server_count("AND state = 'idle in transaction (aborted)'")
-    if aborted is not None:
-        check("sql-error: no failed transaction left", aborted == 0,
-              f"aborted={aborted}")
-    # 池里每条连接都可能被轮到，多发几个普通查询验证没有残留事务
-    results = await asyncio.gather(*[
-        client.post("/query/normal", json={"limit": 2}) for _ in range(8)])
-    check("sql-error: normal queries after",
-          all(x.status_code == 200 for x in results),
-          str([x.status_code for x in results]))
-
-
-async def t_disconnect(client):
-    """客户端在慢查询执行中断开：连接不得带伤复用，池应恢复。"""
-    before = await stats(client)
-    req = asyncio.create_task(client.post("/query/slow", json={
-        "delay_seconds": 10, "acquire_timeout": 5, "query_timeout": 30}))
-    await asyncio.sleep(0.7)
-    req.cancel()
-    with suppress(asyncio.CancelledError):
-        await req
-    s = await wait_pool_idle(client)
-    check("disconnect: pool recovered", s["idle"] == POOL_SIZE, str(s))
-    check("disconnect: counter bumped",
-          s["counters"]["client_disconnects"]
-          > before["counters"]["client_disconnects"], str(s["counters"]))
-    active = server_count("AND state = 'active'")
-    if active is not None:
-        check("disconnect: nothing running server-side", active == 0,
-              f"active={active}")
-    r = await client.post("/query/normal", json={"limit": 1})
-    check("disconnect: normal query after", r.status_code == 200, r.text)
-
-
-async def t_stress(client):
-    """取消与归还交错的压力测试：连接数不得越限，其他请求照常完成。"""
-    sampler = Sampler(client)
-    stask = asyncio.create_task(sampler.run())
-    rng = random.Random(42)
-
-    async def one(i: int):
-        kind = i % 5
-        try:
-            if kind == 0:
-                return await client.post("/query/error", json={
-                    "mode": "transaction" if i % 10 == 0 else "autocommit"})
-            if kind in (1, 2):
-                return await client.post("/query/slow", json={
-                    "delay_seconds": rng.uniform(0.3, 1.5),
-                    "acquire_timeout": rng.choice([0.5, 2, 30]),
-                    "query_timeout": rng.choice([0.5, 2, 30])})
-            return await client.post("/query/normal", json={
-                "limit": 3,
-                "acquire_timeout": rng.choice([0.5, 30]),
-                "query_timeout": 10})
-        except Exception:  # noqa: BLE001 - 客户端侧异常不计失败
-            return None
-
-    async def aborted(_: int):
-        t = asyncio.create_task(client.post("/query/slow", json={
-            "delay_seconds": 3, "acquire_timeout": 30, "query_timeout": 30}))
-        await asyncio.sleep(rng.uniform(0.1, 0.8))
-        t.cancel()
-        with suppress(asyncio.CancelledError):
-            await t
-
-    tasks = ([one(i) for i in range(30)]
-             + [aborted(i) for i in range(6)])
-    results = await asyncio.gather(*tasks)
-    sampler.stop()
-    await stask
-    ok = sum(1 for r in results
-             if r is not None and r.status_code == 200)
-    check("stress: some requests completed", ok >= 10, f"ok={ok}")
-    check("stress: invariants held", not sampler.violations,
-          "; ".join(sampler.violations[:5]))
-    s = await wait_pool_idle(client, timeout=20)
-    check("stress: pool fully recovered",
-          s["idle"] == POOL_SIZE and s["cleaning"] == 0 and s["waiting"] == 0,
-          str(s))
-    check("stress: opened == size", s["opened_connections"] == POOL_SIZE,
-          str(s))
-    n = server_count()
-    if n is not None:
-        check("stress: server conns == size", n == POOL_SIZE, f"n={n}")
-    r = await client.post("/query/normal", json={"limit": 1})
-    check("stress: normal query after", r.status_code == 200, r.text)
-    print("  stress counters:", s["counters"])
-
-
-# ---------------------------------------------------------------- 入口
-
-async def main() -> int:
-    timeout = httpx.Timeout(60.0)
-    async with httpx.AsyncClient(base_url=BASE, timeout=timeout) as client:
-        for _ in range(60):
-            try:
-                if (await client.get("/pool/stats")).status_code == 200:
-                    break
-            except Exception:  # noqa: BLE001
-                await asyncio.sleep(1)
-        else:
-            print(f"API not reachable at {BASE}")
+def main() -> int:
+    for name, url in (("CONTROL_URL", CONTROL_URL), ("SOURCE_URL", SOURCE_URL),
+                      ("TARGET_URL", TARGET_URL)):
+        if not url:
+            print(f"请设置 {name}")
             return 2
-        print(f"API up at {BASE}, pool size = {POOL_SIZE}, "
-              f"psql checks: {'on' if PSQL else 'off'}")
-        await t_normal(client)
-        await t_queue(client)
-        await t_acquire_timeout(client)
-        await t_queue_cancel(client)
-        await t_query_timeout(client)
-        await t_sql_error(client)
-        await t_disconnect(client)
-        await t_stress(client)
+    wait_api()
+    cleanup_test_leftovers()
+    print(f"API up at {BASE}; restart tests: "
+          f"{'on' if RESTART_CMD else 'off (RESTART_CMD 未设置)'}")
+    with httpx.Client(base_url=BASE, timeout=60) as client:
+        t_undecided(client)
+        t_commit(client)
+        t_rollback(client)
+        t_unknown(client)
+        t_conflict_does_not_touch_prepared(client)
+        t_list(client)
+        t_concurrent_same_decision(client)
+        if RESTART_CMD:
+            t_restart_before_processing(client)
+            t_restart_after_one_side(client)
+            t_restart_after_rollback_side(client)
+    cleanup_test_leftovers()
     print()
     if failures:
         print(f"{len(failures)} FAILURE(S):")
@@ -347,4 +389,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    sys.exit(main())

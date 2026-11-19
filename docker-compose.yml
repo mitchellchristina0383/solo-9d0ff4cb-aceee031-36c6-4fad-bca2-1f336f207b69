@@ -1,31 +1,93 @@
 services:
-  db:
+  control:
     image: postgres:16-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=20"]
     environment:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: app
-      POSTGRES_DB: demo
+      POSTGRES_DB: control
     volumes:
-      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./db/control/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d demo"]
+      test: ["CMD-SHELL", "pg_isready -U app -d control"]
       interval: 2s
       timeout: 3s
       retries: 30
     ports:
       - "5432:5432"
 
+  source:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=20"]
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: source
+    volumes:
+      - ./db/source/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d source"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5433:5432"
+
+  target:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=20"]
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: target
+    volumes:
+      - ./db/target/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d target"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5434:5432"
+
   api:
     build: ./app
-    environment:
-      PGHOST: db
-      PGPORT: "5432"
-      PGDATABASE: demo
+    command: ["sh", "-c", "python wait_for_db.py && uvicorn main:app --host 0.0.0.0 --port 8000"]
+    environment: &db_env
+      CONTROL_HOST: control
+      CONTROL_PORT: "5432"
+      CONTROL_DB: control
+      SOURCE_HOST: source
+      SOURCE_PORT: "5432"
+      SOURCE_DB: source
+      TARGET_HOST: target
+      TARGET_PORT: "5432"
+      TARGET_DB: target
       PGUSER: app
       PGPASSWORD: app
-      POOL_SIZE: "4"
     depends_on:
-      db:
+      control:
+        condition: service_healthy
+      source:
+        condition: service_healthy
+      target:
         condition: service_healthy
     ports:
       - "8000:8000"
+
+  # 一次性任务：准备调拨样例（两侧各一个预备事务，控制库登记调拨号）。
+  #   docker compose --profile seed run --rm seed
+  #   docker compose --profile seed run --rm seed \
+  #       python seed.py --transfer T-2024-0002 --qty 4
+  seed:
+    build: ./app
+    command: ["python", "seed.py", "--transfer", "T-2024-0001"]
+    environment: *db_env
+    depends_on:
+      control:
+        condition: service_healthy
+      source:
+        condition: service_healthy
+      target:
+        condition: service_healthy
+    profiles: ["seed"]
